@@ -1,0 +1,205 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <alsa/asoundlib.h>
+#include <unistd.h>
+#include <math.h>
+#include <getopt.h>
+
+#define SAMPLE_RATE 44100
+#define CHANNELS 2
+#define PCM_DEVICE "default"
+#define BUFFER_SIZE 4096
+
+// WAV header structure
+typedef struct {
+    char riff[4];
+    unsigned int overall_size;
+    char wave[4];
+    char fmt_chunk_marker[4];
+    unsigned int length_of_fmt;
+    unsigned short format_type;
+    unsigned short channels;
+    unsigned int sample_rate;
+    unsigned int byterate;
+    unsigned short block_align;
+    unsigned short bits_per_sample;
+    char data_chunk_header[4];
+    unsigned int data_size;
+} wav_header;
+
+void write_wav_header(FILE *file, int channels, int sample_rate, int bits_per_sample, int data_size) {
+    wav_header header;
+    memcpy(header.riff, "RIFF", 4);
+    header.overall_size = data_size + 36;
+    memcpy(header.wave, "WAVE", 4);
+    memcpy(header.fmt_chunk_marker, "fmt ", 4);
+    header.length_of_fmt = 16;
+    header.format_type = 1;
+    header.channels = channels;
+    header.sample_rate = sample_rate;
+    header.byterate = sample_rate * channels * bits_per_sample / 8;
+    header.block_align = channels * bits_per_sample / 8;
+    header.bits_per_sample = bits_per_sample;
+    memcpy(header.data_chunk_header, "data", 4);
+    header.data_size = data_size;
+
+    fwrite(&header, sizeof(wav_header), 1, file);
+}
+
+void list_devices() {
+    void **hints, **n;
+    char *name, *desc;
+    if (snd_device_name_hint(-1, "pcm", &hints) < 0)
+        return;
+    printf("Available sound devices:
+");
+    for (n = hints; *n != NULL; ++n) {
+        name = snd_device_name_get_hint(*n, "NAME");
+        desc = snd_device_name_get_hint(*n, "DESC");
+        printf("  %s
+", name);
+        free(name);
+        free(desc);
+    }
+    snd_device_name_free_hint(hints);
+}
+
+void play_tone(const char *device, int duration, int freq) {
+    snd_pcm_t *pcm;
+    snd_pcm_hw_params_t *params;
+    short buffer[BUFFER_SIZE];
+    unsigned int rate = SAMPLE_RATE;
+    int err, frames, i;
+    double phase = 0.0, phase_inc = 2 * M_PI * freq / SAMPLE_RATE;
+
+    if ((err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+        fprintf(stderr, "Playback open error: %s\n", snd_strerror(err));
+        return;
+    }
+
+    snd_pcm_hw_params_malloc(&params);
+    snd_pcm_hw_params_any(pcm, params);
+    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(pcm, params, CHANNELS);
+    snd_pcm_hw_params_set_rate_near(pcm, params, &rate, 0);
+    snd_pcm_hw_params(pcm, params);
+    snd_pcm_prepare(pcm);
+
+    for (int d = 0; d < duration * SAMPLE_RATE / BUFFER_SIZE; d++) {
+        for (i = 0; i < BUFFER_SIZE; ++i) {
+            buffer[i] = (short)(32767 * sin(phase));
+            phase += phase_inc;
+            if (phase >= 2 * M_PI) phase -= 2 * M_PI;
+        }
+        frames = snd_pcm_writei(pcm, buffer, BUFFER_SIZE / CHANNELS);
+        if (frames < 0) snd_pcm_prepare(pcm);
+    }
+
+    snd_pcm_drain(pcm);
+    snd_pcm_close(pcm);
+}
+
+void record_audio(const char *device, int duration, const char *filename) {
+    snd_pcm_t *pcm;
+    snd_pcm_hw_params_t *params;
+    short buffer[BUFFER_SIZE];
+    FILE *file;
+    int err, rate = SAMPLE_RATE, total_frames = duration * SAMPLE_RATE;
+
+    if ((err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+        fprintf(stderr, "Capture open error: %s\n", snd_strerror(err));
+        return;
+    }
+
+    file = fopen(filename, "wb");
+    fseek(file, sizeof(wav_header), SEEK_SET); // reserve header space
+
+    snd_pcm_hw_params_malloc(&params);
+    snd_pcm_hw_params_any(pcm, params);
+    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(pcm, params, CHANNELS);
+    snd_pcm_hw_params_set_rate_near(pcm, params, &rate, 0);
+    snd_pcm_hw_params(pcm, params);
+    snd_pcm_prepare(pcm);
+
+    for (int f = 0; f < total_frames; f += BUFFER_SIZE / CHANNELS) {
+        snd_pcm_readi(pcm, buffer, BUFFER_SIZE / CHANNELS);
+        fwrite(buffer, sizeof(short), BUFFER_SIZE, file);
+    }
+
+    int data_size = total_frames * CHANNELS * sizeof(short);
+    fseek(file, 0, SEEK_SET);
+    write_wav_header(file, CHANNELS, SAMPLE_RATE, 16, data_size);
+    fclose(file);
+    snd_pcm_drain(pcm);
+    snd_pcm_close(pcm);
+}
+
+void set_volume(long volume) {
+    snd_mixer_t *handle;
+    snd_mixer_selem_id_t *sid;
+    const char *selem_name = "Master";
+
+    snd_mixer_open(&handle, 0);
+    snd_mixer_attach(handle, "default");
+    snd_mixer_selem_register(handle, NULL, NULL);
+    snd_mixer_load(handle);
+
+    snd_mixer_selem_id_malloc(&sid);
+    snd_mixer_selem_id_set_index(sid, 0);
+    snd_mixer_selem_id_set_name(sid, selem_name);
+
+    snd_mixer_elem_t* elem = snd_mixer_find_selem(handle, sid);
+    if (!elem) {
+        fprintf(stderr, "Unable to find mixer element\n");
+        return;
+    }
+
+    long minv, maxv;
+    snd_mixer_selem_get_playback_volume_range(elem, &minv, &maxv);
+    volume = volume * (maxv - minv) / 100 + minv;
+    snd_mixer_selem_set_playback_volume_all(elem, volume);
+
+    snd_mixer_close(handle);
+    printf("Volume set to %ld%%\n", volume);
+}
+
+void usage(const char *prog) {
+    printf("Usage: %s [options]\n", prog);
+    printf("  -l            List sound devices\n");
+    printf("  -p duration   Play test tone for duration (s)\n");
+    printf("  -r duration   Record to 'record.wav' for duration (s)\n");
+    printf("  -v value      Set volume (0-100)\n");
+    printf("  -d device     Use specified ALSA device\n");
+    printf("  -f freq       Tone frequency (default: 440Hz)\n");
+}
+
+int main(int argc, char *argv[]) {
+    int opt;
+    int play_duration = 0, record_duration = 0, freq = 440;
+    long volume = -1;
+    char device[64] = PCM_DEVICE;
+
+    while ((opt = getopt(argc, argv, "lp:r:v:d:f:")) != -1) {
+        switch (opt) {
+            case 'l': list_devices(); return 0;
+            case 'p': play_duration = atoi(optarg); break;
+            case 'r': record_duration = atoi(optarg); break;
+            case 'v': volume = atol(optarg); break;
+            case 'd': strncpy(device, optarg, sizeof(device)); break;
+            case 'f': freq = atoi(optarg); break;
+            default: usage(argv[0]); return 1;
+        }
+    }
+
+    if (volume >= 0) set_volume(volume);
+    if (play_duration > 0) play_tone(device, play_duration, freq);
+    if (record_duration > 0) record_audio(device, record_duration, "record.wav");
+    if (volume == -1 && play_duration == 0 && record_duration == 0) usage(argv[0]);
+
+    return 0;
+}
